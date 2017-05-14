@@ -34,6 +34,9 @@ void worker::load_config(config * conf) {
 	keepalive_enabled = conf->get_uint("keepalive_timeout") != 0;
 	site_password = conf->get_str("site_password");
 	report_password = conf->get_str("report_password");
+	sitefree = conf->get_bool("sitefree");
+	sitedouble = conf->get_bool("sitedouble");
+	sitehalf = conf->get_bool("sitehalf");
 }
 
 void worker::reload_config(config * conf) {
@@ -86,7 +89,7 @@ std::string worker::work(const std::string &input, std::string &ip, client_opts_
 
 	// Get the action
 	enum action_t {
-		INVALID = 0, ANNOUNCE, SCRAPE, UPDATE, REPORT
+		INVALID = 0, ANNOUNCE, SCRAPE, UPDATE, REPORT, LOAD
 	};
 	action_t action = INVALID;
 
@@ -108,6 +111,10 @@ std::string worker::work(const std::string &input, std::string &ip, client_opts_
 		case 'r':
 			action = REPORT;
 			pos += 6;
+			break;
+		case 'l':
+			action = LOAD;
+			pos += 4;
 			break;
 	}
 
@@ -228,6 +235,15 @@ std::string worker::work(const std::string &input, std::string &ip, client_opts_
 		}
 	}
 
+	if (action == LOAD) {
+		if (passkey == site_password) {
+			raise( SIGHUP);
+			return response("success", client_opts);
+		} else {
+			return error("Authentication failure", client_opts);
+		}
+	}
+
 	// Either a scrape or an announce
 
 	std::unique_lock<std::mutex> ul_lock(db->user_list_mutex);
@@ -286,6 +302,7 @@ std::string worker::announce(const std::string &input, torrent &tor, user_ptr &u
 	bool invalid_ip = false;
 	bool inc_l = false, inc_s = false, dec_l = false, dec_s = false;
 	userid_t userid = u->get_id();
+	bool freeuser = u->get_free_switch();
 
 	params_type::const_iterator peer_id_iterator = params.find("peer_id");
 	if (peer_id_iterator == params.end()) {
@@ -430,7 +447,19 @@ std::string worker::announce(const std::string &input, torrent &tor, user_ptr &u
 			if (tor.free_torrent == NEUTRAL) {
 				downloaded_change = 0;
 				uploaded_change = 0;
-			} else if (tor.free_torrent == FREE || sit != tor.tokened_users.end()) {
+			} else if (sitefree && sitedouble) {
+				downloaded_change = 0;
+				uploaded_change = uploaded_change * 2;
+			} else if (sitefree) {
+				downloaded_change = 0;
+			} else if (sitehalf && sitedouble) {
+				downloaded_change = downloaded_change / 2;
+				uploaded_change = uploaded_change * 2;
+			} else if (sitehalf) {
+				downloaded_change = downloaded_change / 2;
+			} else if (sitedouble) {
+				uploaded_change = uploaded_change * 2;
+			} else if (tor.free_torrent == FREE || sit != tor.tokened_users.end() || freeuser > 0) {
 				if (sit != tor.tokened_users.end()) {
 					expire_token = true;
 					std::stringstream record;
@@ -899,7 +928,8 @@ std::string worker::update(params_type &params, client_opts_t &client_opts) {
 		auto u = users_list.find(passkey);
 		if (u == users_list.end()) {
 			bool protect_ip = params["visible"] == "0";
-			user_ptr tmp_user = std::make_shared<user>(userid, true, protect_ip);
+			bool free_switch = params["free_switch"] > "0";
+			user_ptr tmp_user = std::make_shared<user>(userid, true, protect_ip, free_switch);
 			users_list.insert(std::pair<std::string, user_ptr>(passkey, tmp_user));
 			std::cout << "Added user " << passkey << " with id " << userid << std::endl;
 		} else {
@@ -932,6 +962,7 @@ std::string worker::update(params_type &params, client_opts_t &client_opts) {
 		std::string passkey = params["passkey"];
 		bool can_leech = true;
 		bool protect_ip = false;
+		bool free_switch = params["free_switch"] > "0";
 		if (params["can_leech"] == "0") {
 			can_leech = false;
 		}
@@ -945,6 +976,7 @@ std::string worker::update(params_type &params, client_opts_t &client_opts) {
 		} else {
 			i->second->set_protected(protect_ip);
 			i->second->set_leechstatus(can_leech);
+			i->second->set_free_switch(free_switch);
 			std::cout << "Updated user " << passkey << std::endl;
 		}
 	} else if (params["action"] == "add_whitelist") {
